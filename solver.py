@@ -312,6 +312,10 @@ def validate_deal(board, waste, stock_known, stock):
         raise ValueError(f"Impossible deck: {details}")
     if sum(counts.values()) > TOTAL_CARDS:
         raise ValueError("Known cards exceed a standard deck.")
+    unknown_slots = board.count("?") + (0 if stock_known else stock)
+    unseen_cards = TOTAL_CARDS - sum(counts.values())
+    if unknown_slots > unseen_cards:
+        raise ValueError("Unknown cards exceed the unseen standard-deck pool.")
     return board, waste, stock_known, stock
 
 
@@ -993,7 +997,7 @@ def reveal_unknowns(game, read_card=read_rank):
 
         card = read_card(f"Position {position:02d}: ")
 
-        game.observe_rank(card)
+        card = game.observe_rank(card)
         game.board[position - 1] = card
 
 
@@ -1396,4 +1400,4 @@ if __name__ == "__main__":
 
         print(
             f"\nERROR: {error}"
-        )
+          )
