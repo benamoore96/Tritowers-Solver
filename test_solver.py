@@ -181,6 +181,39 @@ class CliCompatibilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             solver.validate_deal(["?"] * solver.TOTAL_TABLEAU, "A", False, -1)
 
+    def test_validate_deal_rejects_unknown_slots_beyond_unseen_pool(self):
+        known_board = (list(solver.RANKS) * 3)[:solver.TOTAL_TABLEAU]
+        for board, stock_known, stock in (
+            (known_board, False, 24),
+            (["?"] * solver.TOTAL_TABLEAU, False, 53),
+            (["?"] * solver.TOTAL_TABLEAU, False, 24),
+            (["?"] * solver.TOTAL_TABLEAU, True, list(solver.RANKS) * 2),
+        ):
+            with self.subTest(stock_known=stock_known, stock=stock):
+                with self.assertRaisesRegex(ValueError, "Unknown cards exceed"):
+                    solver.validate_deal(board, "A", stock_known, stock)
+
+    def test_validate_deal_accepts_exact_unseen_capacity(self):
+        known_board = (list(solver.RANKS) * 3)[:solver.TOTAL_TABLEAU]
+        for board, stock_known, stock in (
+            (known_board, False, 23),
+            (["?"] * solver.TOTAL_TABLEAU, False, 23),
+            (["?"] * solver.TOTAL_TABLEAU, True, (list(solver.RANKS) * 2)[:23]),
+        ):
+            with self.subTest(stock_known=stock_known):
+                self.assertEqual(
+                    solver.validate_deal(board, "A", stock_known, stock)[3], stock
+                )
+
+    def test_reveal_unknowns_stores_normalized_rank(self):
+        board = ["?"] * solver.TOTAL_TABLEAU
+        board[19:28] = ["3", "4", "5", "6", "7", "8", "9", "10", "J"]
+        game = solver.Game(board, "A", False, 1)
+        solver.reveal_unknowns(game, read_card=lambda _: "k")
+        self.assertEqual(game.board[18], "K")
+        self.assertEqual(game.seen_counts["K"], 1)
+        self.assertIn(19, game.legal_moves())
+
     def test_snapshot_is_stable_and_does_not_alias_state(self):
         game = solver.Game(["?"] * solver.TOTAL_TABLEAU, "A", False, 4)
         snapshot = game.state_snapshot()
