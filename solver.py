@@ -67,6 +67,8 @@ SOLVER BEHAVIOUR
 
 import random
 from collections import Counter
+from dataclasses import dataclass
+from enum import Enum
 
 
 # ======================================================================
@@ -106,6 +108,29 @@ MAX_SIMULATION_MOVES = 100
 
 # In TriTowers, A and K are treated as adjacent.
 ACE_WRAP = True
+
+
+class Evidence(Enum):
+    """What supports a move recommendation."""
+
+    PROVEN = "proven"
+    SAMPLED = "sampled"
+
+
+@dataclass(frozen=True)
+class Recommendation:
+    position: int
+    success_rate: float
+    evidence: Evidence
+    simulations: int = 0
+
+    @property
+    def is_proven(self):
+        return self.evidence is Evidence.PROVEN
+
+    def as_legacy_tuple(self):
+        """Temporary adapter for old CLI code; never implies proof from 1.0."""
+        return self.position, self.success_rate
 
 
 # ======================================================================
@@ -243,6 +268,58 @@ def can_play(card, waste):
 
 
 # ======================================================================
+# STATE VALIDATION AND CLI MIGRATION SURFACE
+# ======================================================================
+
+
+def validate_board(board):
+    """Return a normalized 28-card board or raise ``ValueError``."""
+    if len(board) != TOTAL_TABLEAU:
+        raise ValueError(f"Board must contain exactly {TOTAL_TABLEAU} positions.")
+    normalized = [normalize(card) for card in board]
+    return normalized
+
+
+def validate_deal(board, waste, stock_known, stock):
+    """Normalize and validate the complete known portion of a deal.
+
+    This is the canonical entry point for CLIs and future UIs. Unknown stock is
+    represented by a nonnegative count; known stock remains ordered.
+    """
+    board = validate_board(board)
+    waste = normalize(waste)
+    if waste not in RANKS:
+        raise ValueError("Waste must have a known rank.")
+
+    if stock_known:
+        if not isinstance(stock, (list, tuple)):
+            raise ValueError("Known stock must be an ordered sequence.")
+        normalized_stock = [normalize(card) for card in stock]
+        if any(card not in RANKS for card in normalized_stock):
+            raise ValueError("Known stock cannot contain unknown or removed cards.")
+        stock = normalized_stock
+    else:
+        if isinstance(stock, bool) or not isinstance(stock, int) or stock < 0:
+            raise ValueError("Unknown stock must be a nonnegative card count.")
+
+    counts = Counter(card for card in board if card in RANKS)
+    counts[waste] += 1
+    if stock_known:
+        counts.update(stock)
+    overfull = {rank: count for rank, count in counts.items() if count > COPIES_PER_RANK}
+    if overfull:
+        details = ", ".join(f"{rank}={count}" for rank, count in sorted(overfull.items()))
+        raise ValueError(f"Impossible deck: {details}")
+    if sum(counts.values()) > TOTAL_CARDS:
+        raise ValueError("Known cards exceed a standard deck.")
+    unknown_slots = board.count("?") + (0 if stock_known else stock)
+    unseen_cards = TOTAL_CARDS - sum(counts.values())
+    if unknown_slots > unseen_cards:
+        raise ValueError("Unknown cards exceed the unseen standard-deck pool.")
+    return board, waste, stock_known, stock
+
+
+# ======================================================================
 # GAME STATE
 # ======================================================================
 
@@ -256,25 +333,46 @@ class Game:
         stock
     ):
 
-        self.board = list(board)
-
+        board, waste, stock_known, stock = validate_deal(
+            board, waste, stock_known, stock
+        )
+        self.board = board
         self.waste = waste
-
         self.stock_known = stock_known
-
-        if stock_known:
-            self.stock = list(stock)
-        else:
-            self.stock = int(stock)
+        self.stock = list(stock) if stock_known else stock
 
         # Positions are 1-28.
         self.removed = {
             position
-            for position, card in enumerate(
-                self.board,
-                start=1
-            )
+            for position, card in enumerate(self.board, start=1)
             if card == "--"
+        }
+
+        # Every observed card remains consumed even after it leaves the
+        # tableau or is covered by a later waste card.
+        self.seen_counts = Counter(
+            card for card in self.board if card in RANKS
+        )
+        self.seen_counts[self.waste] += 1
+        if self.stock_known:
+            self.seen_counts.update(self.stock)
+        self._validate_seen_counts()
+
+    @property
+    def stock_remaining(self):
+        """Number of stock cards remaining, independent of stock mode."""
+        return len(self.stock) if self.stock_known else self.stock
+
+    def state_snapshot(self):
+        """Stable read-only-shaped state for CLIs and display adapters."""
+        return {
+            "board": tuple(self.board),
+            "removed": frozenset(self.removed),
+            "waste": self.waste,
+            "stock_known": self.stock_known,
+            "stock": tuple(self.stock) if self.stock_known else self.stock,
+            "stock_remaining": self.stock_remaining,
+            "remaining": self.remaining(),
         }
 
     # ------------------------------------------------------------------
@@ -282,22 +380,69 @@ class Game:
     # ------------------------------------------------------------------
 
     def copy(self):
-
-        if self.stock_known:
-            stock = self.stock.copy()
-        else:
-            stock = self.stock
-
-        new_game = Game(
-            self.board.copy(),
-            self.waste,
-            self.stock_known,
-            stock
-        )
-
+        # Do not reconstruct through __init__: a played tableau card remains in
+        # board for display while also becoming waste, so recounting would count
+        # the same physical card twice. Copy the validated state directly.
+        new_game = object.__new__(Game)
+        new_game.board = self.board.copy()
+        new_game.waste = self.waste
+        new_game.stock_known = self.stock_known
+        new_game.stock = self.stock.copy() if self.stock_known else self.stock
         new_game.removed = self.removed.copy()
-
+        new_game.seen_counts = self.seen_counts.copy()
         return new_game
+
+    def _validate_seen_counts(self):
+        overfull = {
+            rank: count
+            for rank, count in self.seen_counts.items()
+            if count > COPIES_PER_RANK
+        }
+        if overfull:
+            details = ", ".join(
+                f"{rank}={count}" for rank, count in sorted(overfull.items())
+            )
+            raise ValueError(f"Impossible deck: {details}")
+
+    def observe_rank(self, card):
+        """Record one newly observed card, rejecting impossible deals."""
+        card = normalize(card)
+        if card not in RANKS:
+            raise ValueError("An observed card must have a known rank.")
+        if self.seen_counts[card] >= COPIES_PER_RANK:
+            raise ValueError(f"Impossible deck: more than four {card} cards.")
+        self.seen_counts[card] += 1
+        return card
+
+    def unknown_counts(self):
+        return {
+            rank: COPIES_PER_RANK - self.seen_counts[rank]
+            for rank in RANKS
+        }
+
+    def unknown_card_pool(self):
+        return [
+            rank
+            for rank, count in self.unknown_counts().items()
+            for _ in range(count)
+        ]
+
+    def sample_unknown_card(self, rng=None):
+        pool = self.unknown_card_pool()
+        if not pool:
+            raise ValueError("No unknown cards remain in the deck.")
+        rng = rng or random
+        return self.observe_rank(rng.choice(pool))
+
+    def observe_draw(self, card):
+        if self.stock_known:
+            raise ValueError("Cannot manually observe a known stock.")
+        if self.stock <= 0:
+            raise ValueError("The stock is empty.")
+        card = self.observe_rank(card)
+        self.stock -= 1
+        self.waste = card
+        return card
 
     # ------------------------------------------------------------------
     # TABLEAU REMAINING
@@ -384,13 +529,24 @@ class Game:
     # ------------------------------------------------------------------
 
     def play(self, position):
+        """Apply one legal tableau move.
 
+        Keeping validation at the state boundary prevents callers, tests, and
+        future interfaces from creating impossible games.
+        """
+        if not isinstance(position, int) or not 1 <= position <= TOTAL_TABLEAU:
+            raise ValueError(f"Invalid tableau position: {position!r}")
+        if position in self.removed:
+            raise ValueError(f"Position {position:02d} has already been removed.")
+        if position not in self.exposed():
+            raise ValueError(f"Position {position:02d} is not exposed.")
         card = self.board[position - 1]
-
+        if card not in RANKS:
+            raise ValueError(f"Position {position:02d} has no known playable card.")
+        if not can_play(card, self.waste):
+            raise ValueError(f"{card} cannot be played on {self.waste}.")
         self.removed.add(position)
-
         self.waste = card
-
         return card
 
 
@@ -399,108 +555,23 @@ class Game:
 # ======================================================================
 
 def known_counts(game):
-    """
-    Count every known copy of every rank.
-
-    Unknown cards are NOT counted.
-
-    This allows the solver to determine the possible composition
-    of the unknown cards while respecting the four-copy rule.
-    """
-
-    counts = Counter()
-
-    # --------------------------------------------------------------
-    # Tableau
-    # --------------------------------------------------------------
-
-    for position in range(1, 29):
-
-        if position in game.removed:
-            continue
-
-        card = game.board[position - 1]
-
-        if card in RANKS:
-            counts[card] += 1
-
-    # --------------------------------------------------------------
-    # Waste
-    # --------------------------------------------------------------
-
-    if game.waste in RANKS:
-        counts[game.waste] += 1
-
-    # --------------------------------------------------------------
-    # Known stock
-    # --------------------------------------------------------------
-
-    if game.stock_known:
-
-        for card in game.stock:
-            counts[card] += 1
-
-    return counts
+    """Return a copy of all ranks observed in this game."""
+    return game.seen_counts.copy()
 
 
 def unknown_counts(game):
-    """
-    Return how many copies of each rank could still be unknown.
-    """
-
-    known = known_counts(game)
-
-    return {
-        rank: max(
-            0,
-            COPIES_PER_RANK - known[rank]
-        )
-        for rank in RANKS
-    }
+    """Compatibility wrapper for callers outside ``Game``."""
+    return game.unknown_counts()
 
 
 def unknown_card_pool(game):
-    """
-    Create a weighted pool of possible unknown cards.
-
-    For example, if there are:
-
-        A = 3 remaining
-        2 = 1 remaining
-        3 = 0 remaining
-
-    then A appears three times in the pool and 2 once.
-
-    This is much more accurate than selecting each rank with
-    equal probability.
-    """
-
-    counts = unknown_counts(game)
-
-    pool = []
-
-    for rank, count in counts.items():
-
-        pool.extend(
-            [rank] * count
-        )
-
-    return pool
+    """Compatibility wrapper for callers outside ``Game``."""
+    return game.unknown_card_pool()
 
 
-def random_unknown_card(game):
-    """
-    Randomly choose an unknown card while respecting the
-    four-copy-per-rank rule.
-    """
-
-    pool = unknown_card_pool(game)
-
-    if not pool:
-
-        return random.choice(RANKS)
-
-    return random.choice(pool)
+def random_unknown_card(game, rng=None):
+    """Sample and consume one previously unknown card."""
+    return game.sample_unknown_card(rng)
 
 
 # ======================================================================
@@ -907,7 +978,7 @@ Enter all 23 cards on ONE line.
 # REVEAL UNKNOWN CARDS
 # ======================================================================
 
-def reveal_unknowns(game):
+def reveal_unknowns(game, read_card=read_rank):
 
     """
     Ask for every newly exposed unknown tableau card.
@@ -924,10 +995,9 @@ def reveal_unknowns(game):
 
     for position in unknown_positions:
 
-        card = read_rank(
-            f"Position {position:02d}: "
-        )
+        card = read_card(f"Position {position:02d}: ")
 
+        card = game.observe_rank(card)
         game.board[position - 1] = card
 
 
@@ -935,7 +1005,7 @@ def reveal_unknowns(game):
 # STOCK DRAW
 # ======================================================================
 
-def draw(game):
+def draw(game, read_card=read_rank, emit=print):
 
     # ------------------------------------------------------------------
     # KNOWN STOCK
@@ -950,9 +1020,7 @@ def draw(game):
 
         game.waste = card
 
-        print(
-            f"DRAW -> {card}"
-        )
+        emit(f"DRAW -> {card}")
 
         return True
 
@@ -964,13 +1032,9 @@ def draw(game):
         return False
 
     # The user only tells us what card actually appeared.
-    card = read_rank(
-        "DRAW -> "
-    )
+    card = read_card("DRAW -> ")
 
-    game.stock -= 1
-
-    game.waste = card
+    game.observe_draw(card)
 
     return True
 
@@ -980,42 +1044,34 @@ def draw(game):
 # ======================================================================
 
 def move_score(game, position):
+    """Score only consequences caused by this move.
 
+    The former implementation rescored every already exposed card and added a
+    sibling-constant "cards removed" term. That made most of the score unrelated
+    to the candidate move and produced avoidable ties.
+    """
+    before_exposed = set(game.exposed())
     child = game.copy()
-
     child.play(position)
+    newly_exposed = set(child.exposed()) - before_exposed
 
     score = 0
-
-    # Reward cards exposed by this move.
-    for exposed_position in child.exposed():
-
-        card = child.board[
-            exposed_position - 1
-        ]
-
+    for exposed_position in newly_exposed:
+        card = child.board[exposed_position - 1]
         if card == "?":
-
-            # An unknown card becoming exposed is valuable
-            # because it gives the solver more information.
             score += 20
-
         else:
-
             score += 10
-
-            if can_play(
-                card,
-                child.waste
-            ):
-
+            if can_play(card, child.waste):
                 score += 8
 
-    # Reward clearing tableau cards.
-    score += (
-        TOTAL_TABLEAU - child.remaining()
-    ) * 2
-
+    # Prefer moves that remove a blocker from still-covered cards. This differs
+    # between sibling moves and measures genuine future progress.
+    score += sum(
+        position in blockers
+        for covered, blockers in BLOCKERS.items()
+        if covered not in child.removed
+    )
     return score
 
 
@@ -1024,78 +1080,17 @@ def move_score(game, position):
 # ======================================================================
 
 def guaranteed_moves(game):
+    """Return moves that immediately and provably clear the tableau.
 
+    A Monte Carlo success rate, or merely having stock left, is not a proof.
+    Broader proof-producing search can be added separately.
     """
-    Look for immediately safe moves.
-
-    This is deliberately fast so that normal gameplay remains
-    responsive.
-
-    If no guaranteed move exists, the statistical solver takes
-    over.
-    """
-
     result = []
-
     for position in game.legal_moves():
-
         child = game.copy()
-
         child.play(position)
-
-        # --------------------------------------------------------------
-        # Immediate win.
-        # --------------------------------------------------------------
-
         if child.remaining() == 0:
-
             result.append(position)
-
-            continue
-
-        safe = True
-
-        # --------------------------------------------------------------
-        # Check newly exposed known cards.
-        # --------------------------------------------------------------
-
-        for exposed_position in child.exposed():
-
-            card = child.board[
-                exposed_position - 1
-            ]
-
-            if card == "?":
-                continue
-
-            if can_play(
-                card,
-                child.waste
-            ):
-                continue
-
-            no_stock = (
-                (
-                    child.stock_known
-                    and not child.stock
-                )
-                or
-                (
-                    not child.stock_known
-                    and child.stock <= 0
-                )
-            )
-
-            if no_stock:
-
-                safe = False
-
-                break
-
-        if safe:
-
-            result.append(position)
-
     return result
 
 
@@ -1105,7 +1100,8 @@ def guaranteed_moves(game):
 
 def simulate(
     game,
-    first_move=None
+    first_move=None,
+    rng=None
 ):
 
     """
@@ -1115,6 +1111,7 @@ def simulate(
     the known cards and the four-copy rule.
     """
 
+    rng = rng or random
     g = game.copy()
 
     # --------------------------------------------------------------
@@ -1129,9 +1126,11 @@ def simulate(
     # Simulate.
     # --------------------------------------------------------------
 
-    for _ in range(
-        MAX_SIMULATION_MOVES
-    ):
+    # Every iteration either removes a tableau card or consumes a stock card.
+    max_transitions = g.remaining() + (
+        len(g.stock) if g.stock_known else g.stock
+    )
+    for _ in range(max_transitions):
 
         # ----------------------------------------------------------
         # Win.
@@ -1150,7 +1149,7 @@ def simulate(
             if g.board[position - 1] == "?":
 
                 g.board[position - 1] = (
-                    random_unknown_card(g)
+                    random_unknown_card(g, rng)
                 )
 
         # ----------------------------------------------------------
@@ -1182,7 +1181,7 @@ def simulate(
                 :min(3, len(scored))
             ]
 
-            _, position = random.choice(
+            _, position = rng.choice(
                 top
             )
 
@@ -1210,9 +1209,7 @@ def simulate(
 
             g.stock -= 1
 
-            g.waste = (
-                random_unknown_card(g)
-            )
+            g.waste = g.sample_unknown_card(rng)
 
     return (
         g.remaining() == 0
@@ -1223,105 +1220,51 @@ def simulate(
 # PROBABILITY
 # ======================================================================
 
-def probability(
-    game,
-    position
-):
-
-    wins = 0
-
-    for _ in range(
-        SIMULATIONS
-    ):
-
-        if simulate(
-            game,
-            first_move=position
-        ):
-
-            wins += 1
-
-    return (
-        wins / SIMULATIONS
+def probability(game, position, simulations=SIMULATIONS, rng=None):
+    """Estimate a move's win rate with reproducible injected randomness."""
+    if simulations <= 0:
+        raise ValueError("simulations must be positive")
+    rng = rng or random
+    wins = sum(
+        simulate(game, first_move=position, rng=rng)
+        for _ in range(simulations)
     )
+    return wins / simulations
 
 
 # ======================================================================
 # BEST MOVE
 # ======================================================================
 
-def best_move(game):
+def best_move(game, simulations=SIMULATIONS, rng=None):
+    """Return a recommendation whose evidence type cannot be confused.
 
+    A sampled rate of 100% remains sampled evidence, never a proof.
+    """
     moves = game.legal_moves()
-
     if not moves:
+        return None
 
-        return None, None
+    proven = guaranteed_moves(game)
+    if proven:
+        position = max(proven, key=lambda candidate: move_score(game, candidate))
+        return Recommendation(position, 1.0, Evidence.PROVEN)
 
-    # ------------------------------------------------------------------
-    # FIRST: GUARANTEED MOVES
-    # ------------------------------------------------------------------
-
-    guaranteed = guaranteed_moves(
-        game
-    )
-
-    if guaranteed:
-
-        guaranteed.sort(
-            key=lambda position:
-                move_score(
-                    game,
-                    position
-                ),
-            reverse=True
+    rng = rng or random
+    scored = [
+        (
+            probability(game, position, simulations=simulations, rng=rng),
+            move_score(game, position),
+            position,
         )
-
-        return (
-            guaranteed[0],
-            1.0
-        )
-
-    # ------------------------------------------------------------------
-    # SECOND: STATISTICAL SEARCH
-    # ------------------------------------------------------------------
-
-    best_position = None
-
-    best_probability = -1.0
-
-    best_score = -1
-
-    for position in moves:
-
-        p = probability(
-            game,
-            position
-        )
-
-        score = move_score(
-            game,
-            position
-        )
-
-        if (
-            p > best_probability
-            or
-            (
-                p == best_probability
-                and score > best_score
-            )
-        ):
-
-            best_probability = p
-
-            best_score = score
-
-            best_position = position
-
-    return (
-        best_position,
-        best_probability
+        for position in moves
+    ]
+    success_rate, _, position = max(scored)
+    return Recommendation(
+        position,
+        success_rate,
+        Evidence.SAMPLED,
+        simulations,
     )
 
 
@@ -1399,19 +1342,15 @@ def main():
         # Find best move.
         # --------------------------------------------------------------
 
-        position, success_probability = (
-            best_move(game)
-        )
-
-        card = game.board[
-            position - 1
-        ]
+        recommendation = best_move(game)
+        position = recommendation.position
+        card = game.board[position - 1]
 
         # --------------------------------------------------------------
         # Guaranteed route.
         # --------------------------------------------------------------
 
-        if success_probability == 1.0:
+        if recommendation.evidence is Evidence.PROVEN:
 
             print(
                 f"\nPLAY {card} @ "
@@ -1428,7 +1367,8 @@ def main():
             print(
                 f"\nPLAY {card} @ "
                 f"{position:02d} "
-                f"[{success_probability * 100:.1f}%]"
+                f"[{recommendation.success_rate * 100:.1f}% sampled "
+                f"over {recommendation.simulations} runs]"
             )
 
         # --------------------------------------------------------------
@@ -1460,4 +1400,4 @@ if __name__ == "__main__":
 
         print(
             f"\nERROR: {error}"
-        )
+          )
