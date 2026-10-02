@@ -66,6 +66,7 @@ SOLVER BEHAVIOUR
 """
 
 import random
+import time
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -1257,27 +1258,52 @@ def simulate(
 # PROBABILITY
 # ======================================================================
 
-def probability(game, position, simulations=SIMULATIONS, rng=None):
-    """Estimate a move's win rate with reproducible injected randomness."""
+MIN_BUDGET_SIMULATIONS = 20
+
+
+def estimate(game, position, simulations=SIMULATIONS, rng=None, deadline=None):
+    """Return ``(win_rate, runs)`` for a first move.
+
+    Stops early once ``deadline`` (a ``time.monotonic()`` value) has passed, but
+    never before MIN_BUDGET_SIMULATIONS runs so a rate is always meaningful.
+    """
     if simulations <= 0:
         raise ValueError("simulations must be positive")
     rng = rng or random
-    wins = sum(
-        simulate(game, first_move=position, rng=rng)
-        for _ in range(simulations)
-    )
-    return wins / simulations
+    wins = runs = 0
+    while runs < simulations:
+        if (
+            deadline is not None
+            and runs >= MIN_BUDGET_SIMULATIONS
+            and time.monotonic() >= deadline
+        ):
+            break
+        wins += bool(simulate(game, first_move=position, rng=rng))
+        runs += 1
+    return wins / runs, runs
+
+
+def probability(game, position, simulations=SIMULATIONS, rng=None):
+    """Estimate a move's win rate with reproducible injected randomness."""
+    return estimate(game, position, simulations, rng)[0]
 
 
 # ======================================================================
 # BEST MOVE
 # ======================================================================
 
-def best_move(game, simulations=SIMULATIONS, rng=None):
+def best_move(game, simulations=SIMULATIONS, rng=None, time_budget=None):
     """Return a recommendation whose evidence type cannot be confused.
 
     A sampled rate of 100% remains sampled evidence, never a proof.
+
+    ``time_budget`` (seconds, optional) caps total sampling time. It is shared
+    equally between candidates, each still gets at least MIN_BUDGET_SIMULATIONS
+    runs, and the returned ``simulations`` is the smallest run count any
+    candidate received. Without it, behaviour is unchanged.
     """
+    if time_budget is not None and time_budget <= 0:
+        raise ValueError("time_budget must be positive")
     moves = game.legal_moves()
     if not moves:
         return None
@@ -1288,20 +1314,26 @@ def best_move(game, simulations=SIMULATIONS, rng=None):
         return Recommendation(position, 1.0, Evidence.PROVEN)
 
     rng = rng or random
-    scored = [
-        (
-            probability(game, position, simulations=simulations, rng=rng),
-            move_score(game, position),
-            position,
+    start = time.monotonic()
+    scored = []
+    runs_used = []
+    for index, position in enumerate(moves, start=1):
+        deadline = (
+            None if time_budget is None
+            else start + time_budget * index / len(moves)
         )
-        for position in moves
-    ]
+        if deadline is None:
+            rate, runs = probability(game, position, simulations, rng), simulations
+        else:
+            rate, runs = estimate(game, position, simulations, rng, deadline)
+        runs_used.append(runs)
+        scored.append((rate, move_score(game, position), position))
     success_rate, _, position = max(scored)
     return Recommendation(
         position,
         success_rate,
         Evidence.SAMPLED,
-        simulations,
+        min(runs_used),
     )
 
 
@@ -1437,4 +1469,4 @@ if __name__ == "__main__":
 
         print(
             f"\nERROR: {error}"
-      )
+        )
