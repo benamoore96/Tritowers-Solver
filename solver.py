@@ -66,6 +66,7 @@ SOLVER BEHAVIOUR
 """
 
 import random
+import time
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -102,6 +103,8 @@ TOTAL_TABLEAU = 28
 TOTAL_WASTE = 1
 TOTAL_STOCK = 23
 TOTAL_CARDS = 52
+
+assert TOTAL_TABLEAU + TOTAL_WASTE + TOTAL_STOCK == TOTAL_CARDS, "deck layout must account for every card"
 
 SIMULATIONS = 1200
 MAX_SIMULATION_MOVES = 100
@@ -261,7 +264,7 @@ def can_play(card, waste):
     if abs(card_value - waste_value) == 1:
         return True
 
-    if ACE_WRAP and {card_value, waste_value} == {1, 13}:
+    if ACE_WRAP and {card_value, waste_value} == {VALUE["A"], VALUE["K"]}:
         return True
 
     return False
@@ -452,7 +455,7 @@ class Game:
 
         count = 0
 
-        for position in range(1, 29):
+        for position in range(1, TOTAL_TABLEAU + 1):
 
             if position in self.removed:
                 continue
@@ -469,36 +472,16 @@ class Game:
     # ------------------------------------------------------------------
 
     def exposed(self):
-
-        """
-        Return all currently exposed tableau positions.
-        """
-
-        result = []
-
-        for position in range(1, 29):
-
-            if position in self.removed:
-                continue
-
-            card = self.board[position - 1]
-
-            if card == "--":
-                continue
-
-            blockers = BLOCKERS.get(
-                position,
-                ()
-            )
-
-            if all(
-                blocker in self.removed
-                for blocker in blockers
-            ):
-
-                result.append(position)
-
-        return result
+        """Return all currently exposed tableau positions, in position order."""
+        removed = self.removed
+        board = self.board
+        return [
+            position
+            for position in range(1, TOTAL_TABLEAU + 1)
+            if position not in removed
+            and board[position - 1] != "--"
+            and BLOCKER_SETS[position] <= removed
+        ]
 
     # ------------------------------------------------------------------
     # LEGAL MOVES
@@ -779,6 +762,22 @@ BOTTOM ROW:
 # SETUP
 # ======================================================================
 
+def read_stock_count(read_line=None, emit=print):
+    """Ask how many stock cards remain when entering a game in progress."""
+    read_line = read_line or input
+    while True:
+        raw = read_line(
+            f"Stock cards remaining (0-{TOTAL_STOCK}): "
+        ).strip()
+        try:
+            count = int(raw)
+        except ValueError:
+            count = -1
+        if 0 <= count <= TOTAL_STOCK:
+            return count
+        emit(f"Please enter a whole number from 0 to {TOTAL_STOCK}.")
+
+
 def setup():
 
     explain()
@@ -934,8 +933,13 @@ Enter all 23 cards on ONE line.
 
     else:
 
-        # 52 total - 28 tableau - 1 waste = 23 stock.
-        stock = TOTAL_STOCK
+        # A fresh deal has 52 - 28 tableau - 1 waste = 23 stock cards. Cleared
+        # tableau cards (--) mean the game is under way, so the count is asked.
+        stock = (
+            read_stock_count()
+            if "--" in board
+            else TOTAL_STOCK
+        )
 
         stock_known = False
 
@@ -1043,26 +1047,60 @@ def draw(game, read_card=read_rank, emit=print):
 # MOVE HEURISTIC
 # ======================================================================
 
+BLOCKER_SETS = {
+    position: frozenset(BLOCKERS.get(position, ()))
+    for position in range(1, TOTAL_TABLEAU + 1)
+}
+
+COVERED_BY = {
+    blocker: tuple(sorted(
+        covered for covered, blockers in BLOCKERS.items() if blocker in blockers
+    ))
+    for blocker in range(1, TOTAL_TABLEAU + 1)
+}
+
+
+def _newly_exposed(game, position):
+    """Positions that become exposed when ``position`` is removed.
+
+    Only cards that ``position`` was blocking can change, so nothing is copied
+    and the rest of the board is not rescanned.
+    """
+    removed = game.removed
+    return [
+        covered
+        for covered in COVERED_BY[position]
+        if covered not in removed
+        and game.board[covered - 1] != "--"
+        and all(blocker == position or blocker in removed
+                for blocker in BLOCKERS[covered])
+    ]
+
+
 def move_score(game, position):
     """Score only consequences caused by this move.
 
     The former implementation rescored every already exposed card and added a
     sibling-constant "cards removed" term. That made most of the score unrelated
     to the candidate move and produced avoidable ties.
+
+    Evaluated without copying the game: playing ``position`` only adds it to
+    ``removed`` and makes its card the waste, so the result is computed from
+    those two facts. Scores are identical to the copying implementation.
     """
-    before_exposed = set(game.exposed())
-    child = game.copy()
-    child.play(position)
-    newly_exposed = set(child.exposed()) - before_exposed
+    board = game.board
+    removed = game.removed | {position}
+    waste = board[position - 1]
+    newly_exposed = _newly_exposed(game, position)
 
     score = 0
     for exposed_position in newly_exposed:
-        card = child.board[exposed_position - 1]
+        card = board[exposed_position - 1]
         if card == "?":
             score += 20
         else:
             score += 10
-            if can_play(card, child.waste):
+            if can_play(card, waste):
                 score += 8
 
     # Prefer moves that remove a blocker from still-covered cards. This differs
@@ -1070,7 +1108,7 @@ def move_score(game, position):
     score += sum(
         position in blockers
         for covered, blockers in BLOCKERS.items()
-        if covered not in child.removed
+        if covered not in removed
     )
     return score
 
@@ -1220,27 +1258,52 @@ def simulate(
 # PROBABILITY
 # ======================================================================
 
-def probability(game, position, simulations=SIMULATIONS, rng=None):
-    """Estimate a move's win rate with reproducible injected randomness."""
+MIN_BUDGET_SIMULATIONS = 20
+
+
+def estimate(game, position, simulations=SIMULATIONS, rng=None, deadline=None):
+    """Return ``(win_rate, runs)`` for a first move.
+
+    Stops early once ``deadline`` (a ``time.monotonic()`` value) has passed, but
+    never before MIN_BUDGET_SIMULATIONS runs so a rate is always meaningful.
+    """
     if simulations <= 0:
         raise ValueError("simulations must be positive")
     rng = rng or random
-    wins = sum(
-        simulate(game, first_move=position, rng=rng)
-        for _ in range(simulations)
-    )
-    return wins / simulations
+    wins = runs = 0
+    while runs < simulations:
+        if (
+            deadline is not None
+            and runs >= MIN_BUDGET_SIMULATIONS
+            and time.monotonic() >= deadline
+        ):
+            break
+        wins += bool(simulate(game, first_move=position, rng=rng))
+        runs += 1
+    return wins / runs, runs
+
+
+def probability(game, position, simulations=SIMULATIONS, rng=None):
+    """Estimate a move's win rate with reproducible injected randomness."""
+    return estimate(game, position, simulations, rng)[0]
 
 
 # ======================================================================
 # BEST MOVE
 # ======================================================================
 
-def best_move(game, simulations=SIMULATIONS, rng=None):
+def best_move(game, simulations=SIMULATIONS, rng=None, time_budget=None):
     """Return a recommendation whose evidence type cannot be confused.
 
     A sampled rate of 100% remains sampled evidence, never a proof.
+
+    ``time_budget`` (seconds, optional) caps total sampling time. It is shared
+    equally between candidates, each still gets at least MIN_BUDGET_SIMULATIONS
+    runs, and the returned ``simulations`` is the smallest run count any
+    candidate received. Without it, behaviour is unchanged.
     """
+    if time_budget is not None and time_budget <= 0:
+        raise ValueError("time_budget must be positive")
     moves = game.legal_moves()
     if not moves:
         return None
@@ -1251,20 +1314,26 @@ def best_move(game, simulations=SIMULATIONS, rng=None):
         return Recommendation(position, 1.0, Evidence.PROVEN)
 
     rng = rng or random
-    scored = [
-        (
-            probability(game, position, simulations=simulations, rng=rng),
-            move_score(game, position),
-            position,
+    start = time.monotonic()
+    scored = []
+    runs_used = []
+    for index, position in enumerate(moves, start=1):
+        deadline = (
+            None if time_budget is None
+            else start + time_budget * index / len(moves)
         )
-        for position in moves
-    ]
+        if deadline is None:
+            rate, runs = probability(game, position, simulations, rng), simulations
+        else:
+            rate, runs = estimate(game, position, simulations, rng, deadline)
+        runs_used.append(runs)
+        scored.append((rate, move_score(game, position), position))
     success_rate, _, position = max(scored)
     return Recommendation(
         position,
         success_rate,
         Evidence.SAMPLED,
-        simulations,
+        min(runs_used),
     )
 
 
@@ -1400,4 +1469,4 @@ if __name__ == "__main__":
 
         print(
             f"\nERROR: {error}"
-  )
+        )
