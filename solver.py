@@ -103,6 +103,8 @@ TOTAL_WASTE = 1
 TOTAL_STOCK = 23
 TOTAL_CARDS = 52
 
+assert TOTAL_TABLEAU + TOTAL_WASTE + TOTAL_STOCK == TOTAL_CARDS, "deck layout must account for every card"
+
 SIMULATIONS = 1200
 MAX_SIMULATION_MOVES = 100
 
@@ -261,7 +263,7 @@ def can_play(card, waste):
     if abs(card_value - waste_value) == 1:
         return True
 
-    if ACE_WRAP and {card_value, waste_value} == {1, 13}:
+    if ACE_WRAP and {card_value, waste_value} == {VALUE["A"], VALUE["K"]}:
         return True
 
     return False
@@ -452,7 +454,7 @@ class Game:
 
         count = 0
 
-        for position in range(1, 29):
+        for position in range(1, TOTAL_TABLEAU + 1):
 
             if position in self.removed:
                 continue
@@ -469,36 +471,16 @@ class Game:
     # ------------------------------------------------------------------
 
     def exposed(self):
-
-        """
-        Return all currently exposed tableau positions.
-        """
-
-        result = []
-
-        for position in range(1, 29):
-
-            if position in self.removed:
-                continue
-
-            card = self.board[position - 1]
-
-            if card == "--":
-                continue
-
-            blockers = BLOCKERS.get(
-                position,
-                ()
-            )
-
-            if all(
-                blocker in self.removed
-                for blocker in blockers
-            ):
-
-                result.append(position)
-
-        return result
+        """Return all currently exposed tableau positions, in position order."""
+        removed = self.removed
+        board = self.board
+        return [
+            position
+            for position in range(1, TOTAL_TABLEAU + 1)
+            if position not in removed
+            and board[position - 1] != "--"
+            and BLOCKER_SETS[position] <= removed
+        ]
 
     # ------------------------------------------------------------------
     # LEGAL MOVES
@@ -1064,26 +1046,60 @@ def draw(game, read_card=read_rank, emit=print):
 # MOVE HEURISTIC
 # ======================================================================
 
+BLOCKER_SETS = {
+    position: frozenset(BLOCKERS.get(position, ()))
+    for position in range(1, TOTAL_TABLEAU + 1)
+}
+
+COVERED_BY = {
+    blocker: tuple(sorted(
+        covered for covered, blockers in BLOCKERS.items() if blocker in blockers
+    ))
+    for blocker in range(1, TOTAL_TABLEAU + 1)
+}
+
+
+def _newly_exposed(game, position):
+    """Positions that become exposed when ``position`` is removed.
+
+    Only cards that ``position`` was blocking can change, so nothing is copied
+    and the rest of the board is not rescanned.
+    """
+    removed = game.removed
+    return [
+        covered
+        for covered in COVERED_BY[position]
+        if covered not in removed
+        and game.board[covered - 1] != "--"
+        and all(blocker == position or blocker in removed
+                for blocker in BLOCKERS[covered])
+    ]
+
+
 def move_score(game, position):
     """Score only consequences caused by this move.
 
     The former implementation rescored every already exposed card and added a
     sibling-constant "cards removed" term. That made most of the score unrelated
     to the candidate move and produced avoidable ties.
+
+    Evaluated without copying the game: playing ``position`` only adds it to
+    ``removed`` and makes its card the waste, so the result is computed from
+    those two facts. Scores are identical to the copying implementation.
     """
-    before_exposed = set(game.exposed())
-    child = game.copy()
-    child.play(position)
-    newly_exposed = set(child.exposed()) - before_exposed
+    board = game.board
+    removed = game.removed | {position}
+    waste = board[position - 1]
+    newly_exposed = _newly_exposed(game, position)
 
     score = 0
     for exposed_position in newly_exposed:
-        card = child.board[exposed_position - 1]
+        card = board[exposed_position - 1]
         if card == "?":
             score += 20
         else:
             score += 10
-            if can_play(card, child.waste):
+            if can_play(card, waste):
                 score += 8
 
     # Prefer moves that remove a blocker from still-covered cards. This differs
@@ -1091,7 +1107,7 @@ def move_score(game, position):
     score += sum(
         position in blockers
         for covered, blockers in BLOCKERS.items()
-        if covered not in child.removed
+        if covered not in removed
     )
     return score
 
@@ -1421,4 +1437,4 @@ if __name__ == "__main__":
 
         print(
             f"\nERROR: {error}"
-  )
+      )
