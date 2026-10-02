@@ -779,6 +779,22 @@ BOTTOM ROW:
 # SETUP
 # ======================================================================
 
+def read_stock_count(read_line=None, emit=print):
+    """Ask how many stock cards remain when entering a game in progress."""
+    read_line = read_line or input
+    while True:
+        raw = read_line(
+            f"Stock cards remaining (0-{TOTAL_STOCK}): "
+        ).strip()
+        try:
+            count = int(raw)
+        except ValueError:
+            count = -1
+        if 0 <= count <= TOTAL_STOCK:
+            return count
+        emit(f"Please enter a whole number from 0 to {TOTAL_STOCK}.")
+
+
 def setup():
 
     explain()
@@ -934,8 +950,13 @@ Enter all 23 cards on ONE line.
 
     else:
 
-        # 52 total - 28 tableau - 1 waste = 23 stock.
-        stock = TOTAL_STOCK
+        # A fresh deal has 52 - 28 tableau - 1 waste = 23 stock cards. Cleared
+        # tableau cards (--) mean the game is under way, so the count is asked.
+        stock = (
+            read_stock_count()
+            if "--" in board
+            else TOTAL_STOCK
+        )
 
         stock_known = False
 
@@ -1400,4 +1421,4 @@ if __name__ == "__main__":
 
         print(
             f"\nERROR: {error}"
-          )
+  )
