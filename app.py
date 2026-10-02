@@ -32,6 +32,7 @@ def inspect_image(path, corners_text):
     return ex.overlay, ex.rectified, result, d, board, waste, msg
 
 def start(board, waste, stock):
+    if not (waste or "").strip(): raise gr.Error("Choose the waste card before starting.")
     try: s = ui.new_session(board, waste.strip(), stock)
     except Exception as e: raise gr.Error(str(e))
     return s, ui.render_board(s), ui.status(s), "", ""
@@ -53,7 +54,7 @@ with gr.Blocks(title="TriTowers") as demo:
         with gr.Row():
             with gr.Column(scale=1):
                 board = gr.Textbox(label="Board, positions 1-28 (A 2-10 J Q K, ? covered, -- empty)", lines=3, value="? " * 18 + "2 A 3 7 9 J 5 3 9 3")
-                with gr.Row(): waste = gr.Dropdown(RANKS, label="Waste card", allow_custom_value=True); stock = gr.Number(label="Stock cards left (engine count)", value=23, precision=0)
+                with gr.Row(): waste = gr.Dropdown(RANKS, label="Waste card (required)", value=None, allow_custom_value=True); stock = gr.Number(label="Stock cards left (engine count)", value=23, precision=0)
                 begin = gr.Button("Start game", variant="primary")
             with gr.Column(scale=2):
                 view = gr.HTML(); state_line = gr.Markdown(); advice = gr.Markdown()
