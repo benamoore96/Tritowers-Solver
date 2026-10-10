@@ -57,7 +57,7 @@ SOLVER BEHAVIOUR
 7. If no guaranteed route is available, it chooses the route
    with the highest estimated probability of success.
 
-8. Solver moves require NO confirmation.
+8. Confirm solver moves with Enter; use undo or quit at prompts.
 
 9. If the stock is unknown, the user only enters the card
    that actually appears when a draw occurs.
@@ -719,7 +719,7 @@ the highest estimated chance of success.
 DURING PLAY
 -----------
 
-You do NOT need to confirm the solver's moves.
+Confirm each recommendation with Enter. Use undo to restore the previous action.
 
 When a card becomes exposed, simply enter its rank.
 
@@ -779,9 +779,10 @@ def read_stock_count(read_line=None, emit=print):
         emit(f"Please enter a whole number from 0 to {TOTAL_STOCK}.")
 
 
-def setup():
+def setup(show_tutorial=True):
 
-    explain()
+    if show_tutorial:
+        explain()
 
     # ------------------------------------------------------------------
     # ASK ALL INFORMATION QUESTIONS BEFORE CARD ENTRY
@@ -1343,111 +1344,9 @@ def best_move(game, simulations=SIMULATIONS, rng=None, time_budget=None):
 # ======================================================================
 
 def main():
-
-    game = setup()
-
-    print()
-    print("=" * 72)
-    print("                         SOLVER ACTIVE")
-    print("=" * 72)
-
-    while True:
-
-        # --------------------------------------------------------------
-        # Ask for newly exposed unknown cards.
-        # --------------------------------------------------------------
-
-        reveal_unknowns(game)
-
-        # --------------------------------------------------------------
-        # Check for win.
-        # --------------------------------------------------------------
-
-        if game.remaining() == 0:
-
-            print()
-            print("=" * 72)
-            print("                              WIN!")
-            print("=" * 72)
-
-            return
-
-        # --------------------------------------------------------------
-        # Find legal tableau moves.
-        # --------------------------------------------------------------
-
-        moves = game.legal_moves()
-
-        # --------------------------------------------------------------
-        # No tableau move -> draw.
-        # --------------------------------------------------------------
-
-        if not moves:
-
-            if (
-                (
-                    game.stock_known
-                    and not game.stock
-                )
-                or
-                (
-                    not game.stock_known
-                    and game.stock <= 0
-                )
-            ):
-
-                print()
-                print(
-                    "No playable tableau cards "
-                    "and the stock is empty."
-                )
-
-                return
-
-            draw(game)
-
-            continue
-
-        # --------------------------------------------------------------
-        # Find best move.
-        # --------------------------------------------------------------
-
-        recommendation = best_move(game)
-        position = recommendation.position
-        card = game.board[position - 1]
-
-        # --------------------------------------------------------------
-        # Guaranteed route.
-        # --------------------------------------------------------------
-
-        if recommendation.evidence is Evidence.PROVEN:
-
-            print(
-                f"\nPLAY {card} @ "
-                f"{position:02d} "
-                f"[GUARANTEED]"
-            )
-
-        # --------------------------------------------------------------
-        # Statistical route.
-        # --------------------------------------------------------------
-
-        else:
-
-            print(
-                f"\nPLAY {card} @ "
-                f"{position:02d} "
-                f"[{recommendation.success_rate * 100:.1f}% sampled "
-                f"over {recommendation.simulations} runs]"
-            )
-
-        # --------------------------------------------------------------
-        # Automatically apply move.
-        #
-        # No confirmation required.
-        # --------------------------------------------------------------
-
-        game.play(position)
+    """Run the CLI adapter; game rules and recommendations stay in this module."""
+    from tritowers_cli import run
+    run()
 
 
 # ======================================================================

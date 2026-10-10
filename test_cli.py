@@ -3,6 +3,10 @@ import unittest
 import subprocess
 import sys
 from unittest.mock import patch
+import json
+import random
+import tempfile
+from pathlib import Path
 
 import solver
 import tritowers_cli as cli
@@ -31,6 +35,115 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Input ended; solver stopped.", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+    def session(self, game, commands):
+        lines = iter(commands)
+        output = []
+        result = cli.play_session(game, 1, random.Random(1),
+                                  input_fn=lambda _: next(lines), emit=output.append)
+        return result, "\n".join(output)
+
+    def game(self, rank="2", stock=None):
+        board = ["--"] * 28
+        board[18] = rank
+        return solver.Game(board, "A", True, [] if stock is None else stock)
+
+    def test_session_quit_does_not_apply_recommendation(self):
+        result, text = self.session(self.game(), ["quit"])
+        self.assertEqual(result.remaining(), 1)
+        self.assertIn("19: 2", text)
+        self.assertIn("PLAY 2 @ 19", text)
+
+    def test_session_confirm_then_undo_restores_waste_and_counts(self):
+        original = self.game()
+        result, text = self.session(original.copy(), ["", "undo", "quit"])
+        self.assertEqual(result.state_snapshot(), original.state_snapshot())
+        self.assertEqual(result.seen_counts, original.seen_counts)
+        self.assertIn("WIN!", text)
+
+    def test_action_words_cannot_confirm_the_opposite_action(self):
+        for game, command in [(self.game(), "draw"), (self.game("5", ["3"]), "play")]:
+            original = game.copy()
+            with self.subTest(command=command):
+                result, text = self.session(game, [command, "quit"])
+                self.assertEqual(result.state_snapshot(), original.state_snapshot())
+                self.assertEqual(result.seen_counts, original.seen_counts)
+                self.assertIn("Use Enter to confirm", text)
+
+    def test_sampled_display_preserves_percentage_and_run_count(self):
+        rec = {"action": "play", "position": 19, "rank": "2", "evidence": "SAMPLED",
+               "success_rate": 0.375, "simulations": 24}
+        with patch.object(cli, "recommendation_data", return_value=rec):
+            _, text = self.session(self.game(), ["quit"])
+        self.assertIn("37.5% sampled over 24 runs", text)
+
+    def test_skip_tutorial_controls_real_setup_path(self):
+        for flags, calls in [([], 1), (["--skip-tutorial"], 0)]:
+            with self.subTest(flags=flags):
+                with patch.object(solver, "explain") as explain:
+                    with patch("builtins.input", side_effect=EOFError):
+                        with self.assertRaises(EOFError):
+                            cli.run(flags)
+                self.assertEqual(explain.call_count, calls)
+
+    def test_known_draw_can_be_undone(self):
+        original = self.game("5", ["3"])
+        result, _ = self.session(original.copy(), ["", "undo", "quit"])
+        self.assertEqual(result.state_snapshot(), original.state_snapshot())
+        self.assertEqual(result.seen_counts, original.seen_counts)
+
+    def test_reveal_and_play_undo_restores_unseen_pool(self):
+        original = self.game("?")
+        result, _ = self.session(original.copy(), ["2", "", "undo", "quit"])
+        self.assertEqual(result.state_snapshot(), original.state_snapshot())
+        self.assertEqual(result.seen_counts, original.seen_counts)
+
+    def test_unknown_draw_can_be_undone(self):
+        game = self.game("5")
+        game.stock_known, game.stock = False, 1
+        original = game.copy()
+        result, _ = self.session(game, ["", "3", "undo", "quit"])
+        self.assertEqual(result.state_snapshot(), original.state_snapshot())
+        self.assertEqual(result.seen_counts, original.seen_counts)
+
+    def test_queen_is_a_rank_at_reveal_not_quit(self):
+        result, _ = self.session(self.game("?"), ["Q", "quit"])
+        # Quitting before an action rolls back newly entered observations too.
+        self.assertEqual(result.board[18], "?")
+        self.assertEqual(result.seen_counts["Q"], 0)
+
+    def test_bad_rank_rolls_back_before_retry(self):
+        original = self.game("?")
+        result, text = self.session(original.copy(), ["nonsense", "quit"])
+        self.assertEqual(result.state_snapshot(), original.state_snapshot())
+        self.assertIn("Invalid input", text)
+
+    def test_json_entry_point_emits_only_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deal.json"
+            game = self.game()
+            path.write_text(json.dumps(dict(board=game.board, waste=game.waste,
+                                            stock_known=True, stock=[])))
+            result = subprocess.run([sys.executable, solver.__file__, "--input", str(path),
+                                     "--non-interactive", "--simulations", "1", "--seed", "4"],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual((data["action"], data["position"]), ("play", 19))
+            self.assertEqual(data["evidence"], "PROVEN")
+
+    def test_json_rejects_malformed_shapes_and_impossible_deals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deal.json"
+            for data in [[], {}, dict(board=["A"]*28, waste="A", stock_known=True, stock=[]),
+                         dict(board=[1]*28, waste="A", stock_known=True, stock=[])]:
+                path.write_text(json.dumps(data))
+                with self.subTest(data=data):
+                    with self.assertRaises(ValueError):
+                        cli.load_game(path)
+
+    def test_noninteractive_requires_input(self):
+        with self.assertRaises(SystemExit):
+            cli.run(["--non-interactive"])
 
     def test_parser_exposes_seed_budget_and_tutorial_switch(self):
         args = cli.build_parser().parse_args(["--seed", "4", "--simulations", "25", "--skip-tutorial"])
