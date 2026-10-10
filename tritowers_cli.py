@@ -155,7 +155,11 @@ def play_session(game, simulations, rng, input_fn=input, emit=print):
                     return before if command in {"quit", "q", "exit"} else game
             else:
                 if action["action"] == "play":
-                    emit(f"PLAY {action['rank']} @ {action['position']:02d} [{action['evidence']}]")
+                    detail = action["evidence"]
+                    if detail == "SAMPLED":
+                        detail = (f"{action['success_rate'] * 100:.1f}% sampled "
+                                  f"over {action['simulations']} runs")
+                    emit(f"PLAY {action['rank']} @ {action['position']:02d} [{detail}]")
                 else:
                     emit("DRAW")
                 command = input_fn("Enter to confirm, undo, or quit: ").strip().lower()
@@ -168,7 +172,7 @@ def play_session(game, simulations, rng, input_fn=input, emit=print):
                     game = before
                     emit("Nothing to undo.")
                 continue
-            if command not in {"", "play", "draw", "yes", "y"}:
+            if command not in {"", "yes", "y", action["action"]}:
                 game = before
                 emit("Use Enter to confirm, undo, or quit.")
                 continue
@@ -214,10 +218,10 @@ def run(argv=None):
             parser.error("--non-interactive needs known or removed tableau cards, not ?")
         print(json.dumps(recommendation_data(game, args.simulations, random.Random(args.seed))))
         return
-    if not args.skip_tutorial:
-        print("Confirm each recommendation with Enter. Use undo to restore the previous action, or quit.")
     if game is None:
-        game = solver.setup()
+        game = solver.setup(show_tutorial=not args.skip_tutorial)
+    elif not args.skip_tutorial:
+        print("Confirm each recommendation with Enter. Use undo to restore the previous action, or quit.")
     play_session(game, args.simulations, random.Random(args.seed))
 
 
