@@ -66,6 +66,7 @@ SOLVER BEHAVIOUR
 """
 
 import random
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -1453,20 +1454,18 @@ def main():
 # START
 # ======================================================================
 
-if __name__ == "__main__":
-
+def run_cli():
+    """Handle normal terminal stops; let programming errors keep their traceback."""
     try:
-
         main()
-
+    except EOFError:
+        print("Input ended; solver stopped.", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
+        print("\nSolver stopped.", file=sys.stderr)
+        return 130
+    return 0
 
-        print(
-            "\nSolver stopped."
-        )
 
-    except Exception as error:
-
-        print(
-            f"\nERROR: {error}"
-        )
+if __name__ == "__main__":
+    raise SystemExit(run_cli())
