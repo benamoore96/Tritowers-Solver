@@ -60,6 +60,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.seen_counts, original.seen_counts)
         self.assertIn("WIN!", text)
 
+    def test_action_words_cannot_confirm_the_opposite_action(self):
+        for game, command in [(self.game(), "draw"), (self.game("5", ["3"]), "play")]:
+            original = game.copy()
+            with self.subTest(command=command):
+                result, text = self.session(game, [command, "quit"])
+                self.assertEqual(result.state_snapshot(), original.state_snapshot())
+                self.assertEqual(result.seen_counts, original.seen_counts)
+                self.assertIn("Use Enter to confirm", text)
+
+    def test_sampled_display_preserves_percentage_and_run_count(self):
+        rec = {"action": "play", "position": 19, "rank": "2", "evidence": "SAMPLED",
+               "success_rate": 0.375, "simulations": 24}
+        with patch.object(cli, "recommendation_data", return_value=rec):
+            _, text = self.session(self.game(), ["quit"])
+        self.assertIn("37.5% sampled over 24 runs", text)
+
+    def test_skip_tutorial_controls_real_setup_path(self):
+        for flags, calls in [([], 1), (["--skip-tutorial"], 0)]:
+            with self.subTest(flags=flags):
+                with patch.object(solver, "explain") as explain:
+                    with patch("builtins.input", side_effect=EOFError):
+                        with self.assertRaises(EOFError):
+                            cli.run(flags)
+                self.assertEqual(explain.call_count, calls)
+
     def test_known_draw_can_be_undone(self):
         original = self.game("5", ["3"])
         result, _ = self.session(original.copy(), ["", "undo", "quit"])
