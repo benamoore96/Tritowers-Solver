@@ -779,9 +779,10 @@ def read_stock_count(read_line=None, emit=print):
         emit(f"Please enter a whole number from 0 to {TOTAL_STOCK}.")
 
 
-def setup():
+def setup(show_tutorial=True):
 
-    explain()
+    if show_tutorial:
+        explain()
 
     # ------------------------------------------------------------------
     # ASK ALL INFORMATION QUESTIONS BEFORE CARD ENTRY
